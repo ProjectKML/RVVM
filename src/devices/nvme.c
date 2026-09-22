@@ -1271,6 +1271,18 @@ static void nvme_suspend(rvvm_reg_dev_t* dev, rvvm_snapshot_t* snap, bool resume
         rvvm_snapshot_field(snap, nvme->conf);
         rvvm_snapshot_field(snap, nvme->irq_mask);
         rvvm_snapshot_field(snap, nvme->temp_thresh);
+        if (nvme->removable) {
+            rvvm_snapshot_section(snap, "nvme_media");
+            rvvm_snapshot_field(snap, nvme->namespace_id);
+            rvvm_snapshot_field(snap, nvme->namespace_uuid);
+            rvvm_snapshot_field(snap, nvme->serial);
+            rvvm_snapshot_field(snap, nvme->async_config);
+            rvvm_snapshot_field(snap, nvme->async_sqhd);
+            rvvm_snapshot_field(snap, nvme->async_cid);
+            rvvm_snapshot_field(snap, nvme->async_pending);
+            rvvm_snapshot_field(snap, nvme->namespace_changed);
+            rvvm_snapshot_field(snap, nvme->namespace_notified);
+        }
     }
     UNUSED(resume);
 }
