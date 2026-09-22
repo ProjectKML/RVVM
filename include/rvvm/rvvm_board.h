@@ -392,6 +392,20 @@ RVVM_PUBLIC rvvm_reg_dev_t* rvvm_mtd_ram_init(rvvm_machine_t* machine, /**/
  */
 RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_pci_addr_t addr);
 
+typedef struct nvme_device rvvm_nvme_drive_t;
+
+/** Creates an empty, permanent NVMe controller, owned and cleaned up by the machine. */
+RVVM_PUBLIC rvvm_nvme_drive_t* rvvm_nvme_drive_init(rvvm_machine_t* machine, rvvm_pci_addr_t addr, const char* model);
+
+/**
+ * Inserts media or ejects it when blk is NULL. The machine must be paused.
+ * Waits for pending IO and flushes old media. Ownership transfers only on success.
+ * An occupied drive must be ejected before inserting new media.
+ */
+RVVM_PUBLIC bool rvvm_nvme_drive_set_media(rvvm_nvme_drive_t* drive, rvvm_blk_dev_t* blk, bool writable);
+
+RVVM_PUBLIC rvvm_pci_addr_t rvvm_nvme_drive_address(rvvm_nvme_drive_t* drive);
+
 static inline rvvm_pci_func_t* rvvm_nvme_init_auto(rvvm_machine_t* machine, const char* path)
 {
     return rvvm_nvme_init(machine, rvvm_blk_open(path, NULL, RVVM_BLK_RW), -1);

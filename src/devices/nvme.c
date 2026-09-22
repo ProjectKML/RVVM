@@ -20,6 +20,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include <util/atomics.h>
 #include <util/bit_ops.h>
+#include <util/locking.h>
 #include <util/mem_ops.h>
 #include <util/threading.h>
 #include <util/utils.h>
@@ -335,6 +336,8 @@ PUSH_OPTIMIZATION_SIZE
 #define NVME_PAGE_MASK           (NVME_PAGE_SIZE - 1ULL)
 #define NVME_LBA_SIZE            (1ULL << NVME_LBA_SHIFT)
 #define NVME_LBA_MASK            (NVME_LBA_SIZE - 1ULL)
+#define NVME_NS_CHANGE_ENABLE    (1U << 8)
+#define NVME_NS_CHANGE_EVENT     0x00040002U
 
 typedef struct nvme_device nvme_dev_t;
 
@@ -379,8 +382,21 @@ struct nvme_device {
     // Temperature Threshold
     uint32_t temp_thresh;
 
+    bool        removable;
+    bool        writable;
+    uint32_t    namespace_id;
+    uint8_t     namespace_uuid[16];
+    rvvm_lock_t event_lock;
+    uint32_t    async_config;
+    uint32_t    async_sqhd;
+    uint16_t    async_cid;
+    bool        async_pending;
+    bool        namespace_changed;
+    bool        namespace_notified;
+
     // Serial number
     char serial[12];
+    char model[40];
 };
 
 typedef struct {
@@ -511,6 +527,12 @@ static void nvme_reset(nvme_dev_t* nvme)
     while (atomic_load_uint32(&nvme->threads)) {
         rvvm_sched_yield();
     }
+    rvvm_scoped_lock (&nvme->event_lock) {
+        nvme->async_config = 0;
+        nvme->async_pending = false;
+        nvme->namespace_changed = false;
+        nvme->namespace_notified = false;
+    }
     // Reset queues
     for (size_t qid = 0; qid < STATIC_ARRAY_SIZE(nvme->sq); ++qid) {
         nvme_queue_t* queue = &nvme->sq[qid];
@@ -552,6 +574,33 @@ static void nvme_complete_cmd_cs(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t sta
 static inline void nvme_complete_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd, uint32_t status)
 {
     nvme_complete_cmd_cs(nvme, cmd, status, 0);
+}
+
+static void nvme_notify_namespace(nvme_dev_t* nvme)
+{
+    if (nvme->async_pending && nvme->namespace_changed && !nvme->namespace_notified
+        && (nvme->async_config & NVME_NS_CHANGE_ENABLE)) {
+        uint8_t sqe[NVME_SQE_SIZE] = {0};
+        write_uint16_le(sqe + NVME_SQE_CID, nvme->async_cid);
+        nvme_cmd_t cmd = {.sqe = sqe, .sqhd_sqid = nvme->async_sqhd, .cq_id = NVME_QUEUE_ADMIN};
+        nvme->async_pending = false;
+        nvme->namespace_notified = true;
+        nvme_complete_cmd_cs(nvme, &cmd, NVME_SC_SUCCESS, NVME_NS_CHANGE_EVENT);
+    }
+}
+
+static void nvme_async_event(nvme_dev_t* nvme, nvme_cmd_t* cmd)
+{
+    rvvm_scoped_lock (&nvme->event_lock) {
+        if (nvme->async_pending) {
+            nvme_complete_cmd(nvme, cmd, NVME_SC_AER_LIMIT);
+        } else {
+            nvme->async_cid = read_uint16_le(cmd->sqe + NVME_SQE_CID);
+            nvme->async_sqhd = cmd->sqhd_sqid;
+            nvme->async_pending = true;
+            nvme_notify_namespace(nvme);
+        }
+    }
 }
 
 static inline rvvm_addr_t nvme_prepare_prp(nvme_cmd_t* cmd, size_t size)
@@ -752,6 +801,17 @@ static void nvme_get_log_page(nvme_dev_t* nvme, nvme_cmd_t* cmd)
         case NVME_LOG_ERROR:
         case NVME_LOG_FIRMWARE_SLOT:
             break;
+        case NVME_LOG_CHANGED_NS_LIST:
+            rvvm_scoped_lock (&nvme->event_lock) {
+                if (nvme->namespace_changed) {
+                    write_uint32_le(buf, UINT32_MAX);
+                }
+                if (!(cmd->sqe[NVME_SQE_CDW10 + 1] & 0x80)) {
+                    nvme->namespace_changed = false;
+                    nvme->namespace_notified = false;
+                }
+            }
+            break;
         case NVME_LOG_SMART:
             write_uint16_le_m(&buf[1], 315); // Temperature (In Kelvins)
             write_uint8(&buf[3], 94);        // Available Spare Percent
@@ -776,7 +836,7 @@ static void nvme_identify(nvme_dev_t* nvme, nvme_cmd_t* cmd)
     uint32_t nsid = read_uint32_le(cmd->sqe + NVME_SQE_NSID);
     switch (idt) {
         case NVME_CNS_NAMESPACE: {
-            if (nsid != 1) {
+            if (!nvme->blk || nsid != nvme->namespace_id) {
                 break;
             }
             // Namespace usage
@@ -788,12 +848,15 @@ static void nvme_identify(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             // Namespace features
             buf[33]  = 0x09;           // Deallocated blocks read as zero; Supports Deallocate bit in Write Zeroes
             buf[130] = NVME_LBA_SHIFT; // LBA Format: 512b logical blocks
+            if (nvme->removable && !nvme->writable) {
+                buf[99] = 1;
+            }
             break;
         }
         case NVME_CNS_CONTROLLER: {
             // Controller identification
             memcpy(&buf[4], nvme->serial, sizeof(nvme->serial)); // Serial Number
-            rvvm_strlcpy((char*)&buf[24], "NVMe Storage", 40);   // Model
+            rvvm_strlcpy((char*)&buf[24], nvme->model, 40);      // Model
             rvvm_strlcpy((char*)&buf[64], "R2579", 8);           // Firmware Revision
             write_uint32_le(&buf[80], NVME_VS_VERSION);          // Version
 
@@ -803,6 +866,10 @@ static void nvme_identify(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             buf[512] = 0x66; // Submission Queue Max/Cur Entry Size
             buf[513] = 0x44; // Completion Queue Max/Cur Entry Size
             buf[516] = 0x01; // Number of Namespaces
+            if (nvme->removable) {
+                write_uint32_le(&buf[92], NVME_NS_CHANGE_ENABLE);
+                write_uint32_le(&buf[516], EVAL_MAX(nvme->namespace_id, 1U));
+            }
             buf[520] = 0x04; // Supports Dataset Management (TRIM)
             buf[526] = 0x07; // Atomic Write Unit Normal: 4kb
             buf[528] = 0x07; // Atomic Write Unit Power Fail: 4kb
@@ -813,18 +880,19 @@ static void nvme_identify(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             break;
         }
         case NVME_CNS_NSID_LIST:
-            if (nsid < 1) {
-                write_uint32_le(buf, 0x01); // Namespace #1
+            if (nvme->blk && nsid < nvme->namespace_id) {
+                write_uint32_le(buf, nvme->namespace_id);
             }
             break;
         case NVME_CNS_NSID_DESC:
-            if (nsid != 1) {
+            if (!nvme->blk || nsid != nvme->namespace_id) {
                 nvme_complete_cmd(nvme, cmd, NVME_SC_BAD_NAMESPACE);
                 safe_free(buf);
                 return;
             }
             buf[0] = 0x03; // Namespace uses UUID
             buf[1] = 0x10; // UUID length
+            memcpy(&buf[4], nvme->namespace_uuid, sizeof(nvme->namespace_uuid));
             break;
         default:
             rvvm_debug("NVMe identify CNS %#04x unimplemented", idt);
@@ -856,13 +924,22 @@ static void nvme_handle_feature(nvme_dev_t* nvme, nvme_cmd_t* cmd, bool set)
                 feature_val = atomic_load_uint32_relax(&nvme->temp_thresh);
             }
             break;
+        case NVME_FEAT_ASYNC_EVENT:
+            rvvm_scoped_lock (&nvme->event_lock) {
+                if (set) {
+                    nvme->async_config = read_uint32_le(cmd->sqe + NVME_SQE_CDW11) & NVME_NS_CHANGE_ENABLE;
+                    nvme_notify_namespace(nvme);
+                } else {
+                    feature_val = nvme->async_config;
+                }
+            }
+            break;
         case NVME_FEAT_POWER_MGMT:
         case NVME_FEAT_ERROR_RECOVER:
         case NVME_FEAT_VOLATILE_WC:
         case NVME_FEAT_IRQ_COALESCE:
         case NVME_FEAT_IRQ_VECTOR:
         case NVME_FEAT_WR_ATOMIC:
-        case NVME_FEAT_ASYNC_EVENT:
             // Stubs
             break;
         default:
@@ -905,7 +982,7 @@ static void nvme_admin_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd)
             nvme_handle_feature(nvme, cmd, opcode == NVME_ADM_SET_FEATURE);
             return;
         case NVME_ADM_ASYNC_EVENT_REQ:
-            // Nothing ever happens
+            nvme_async_event(nvme, cmd);
             return;
         default:
             rvvm_debug("NVMe admin cmd %#04x unimplemented", opcode);
@@ -917,8 +994,12 @@ static void nvme_admin_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd)
 static void nvme_io_cmd(nvme_dev_t* nvme, nvme_cmd_t* cmd)
 {
     uint8_t opcode = cmd->sqe[NVME_SQE_CDW0];
-    if (read_uint32_le(cmd->sqe + NVME_SQE_NSID) != 1) {
+    if (!nvme->blk || read_uint32_le(cmd->sqe + NVME_SQE_NSID) != nvme->namespace_id) {
         nvme_complete_cmd(nvme, cmd, NVME_SC_BAD_NAMESPACE);
+        return;
+    }
+    if (nvme->removable && !nvme->writable && (opcode == NVME_IO_WRITE || opcode == NVME_IO_DTSM)) {
+        nvme_complete_cmd(nvme, cmd, NVME_SC_NAMESPACE_WP);
         return;
     }
     switch (opcode) {
@@ -1168,7 +1249,7 @@ static rvvm_reg_type_t nvme_type = {
     .max_size = 4,
 };
 
-RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_pci_addr_t addr)
+static nvme_dev_t* nvme_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_pci_addr_t addr, bool removable, const char* model)
 {
     nvme_dev_t* nvme = safe_new_obj(nvme_dev_t);
 
@@ -1176,6 +1257,10 @@ RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_de
     nvme->cq[NVME_QUEUE_ADMIN].data = NVME_CQ_FLAGS_IEN;
 
     nvme->blk = blk;
+    nvme->removable = removable;
+    nvme->writable = true;
+    nvme->namespace_id = blk ? 1 : 0;
+    rvvm_strlcpy(nvme->model, model ? model : "NVMe Storage", sizeof(nvme->model));
     rvvm_randomserial(nvme->serial, sizeof(nvme->serial));
 
     rvvm_reg_desc_t nvme_mmio = {
@@ -1198,8 +1283,59 @@ RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_de
     if (func) {
         // Successfully plugged in
         nvme->func = func;
+        return nvme;
     }
-    return func;
+    return NULL;
+}
+
+RVVM_PUBLIC rvvm_pci_func_t* rvvm_nvme_init(rvvm_machine_t* machine, rvvm_blk_dev_t* blk, rvvm_pci_addr_t addr)
+{
+    nvme_dev_t* nvme = nvme_init(machine, blk, addr, false, NULL);
+    return nvme ? nvme->func : NULL;
+}
+
+RVVM_PUBLIC rvvm_nvme_drive_t* rvvm_nvme_drive_init(rvvm_machine_t* machine, rvvm_pci_addr_t addr, const char* model)
+{
+    return nvme_init(machine, NULL, addr, true, model);
+}
+
+RVVM_PUBLIC bool rvvm_nvme_drive_set_media(rvvm_nvme_drive_t* nvme, rvvm_blk_dev_t* blk, bool writable)
+{
+    if (!nvme || !nvme->removable || (blk && nvme->blk)) {
+        return false;
+    }
+    if (blk && (nvme->namespace_id >= UINT32_MAX - 1 || !rvvm_blk_get_size(blk)
+                || (rvvm_blk_get_size(blk) & NVME_LBA_MASK))) {
+        return false;
+    }
+    while (atomic_load_uint32(&nvme->threads)) {
+        rvvm_sched_yield();
+    }
+    if (nvme->blk && !rvvm_blk_sync(nvme->blk)) {
+        return false;
+    }
+    if (!nvme->blk && !blk) {
+        return true;
+    }
+    rvvm_blk_close(nvme->blk);
+    nvme->blk = blk;
+    nvme->writable = writable;
+    if (blk) {
+        nvme->namespace_id++;
+        rvvm_randombytes(nvme->namespace_uuid, sizeof(nvme->namespace_uuid));
+        nvme->namespace_uuid[6] = (nvme->namespace_uuid[6] & 0x0F) | 0x40;
+        nvme->namespace_uuid[8] = (nvme->namespace_uuid[8] & 0x3F) | 0x80;
+    }
+    rvvm_scoped_lock (&nvme->event_lock) {
+        nvme->namespace_changed = true;
+        nvme_notify_namespace(nvme);
+    }
+    return true;
+}
+
+RVVM_PUBLIC rvvm_pci_addr_t rvvm_nvme_drive_address(rvvm_nvme_drive_t* nvme)
+{
+    return nvme ? rvvm_pci_addr_from_func(nvme->func) : RVVM_PCI_ADDR_ANY;
 }
 
 POP_OPTIMIZATION_SIZE
